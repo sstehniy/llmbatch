@@ -1,7 +1,9 @@
-cat /usr/local/bin/llmcat
 #!/usr/bin/env bash
 
 set -euo pipefail
+
+# Initialize variables for macOS compatibility
+positional=()
 
 # Check for required commands
 required_commands=("fzf" "bat" "tree")
@@ -29,7 +31,6 @@ tree_only=0
 quiet=0
 print=0
 debug=0
-positional=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -89,7 +90,8 @@ EOF
   esac
 done
 
-set -- "${positional[@]}"
+# Handle empty array on macOS
+set -- "${positional[@]:-}"
 target="${1:-}"
 
 # Debug function
