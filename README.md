@@ -1,0 +1,4 @@
+Requirments:
+- fzf
+- bat
+- tree
