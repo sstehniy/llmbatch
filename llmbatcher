@@ -1,0 +1,235 @@
+cat /usr/local/bin/llmcat
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Check for required commands
+required_commands=("fzf" "bat" "tree")
+for cmd in "${required_commands[@]}"; do
+  if ! command -v "$cmd" &> /dev/null; then
+    echo "Error: $cmd is required but not installed." >&2
+    exit 1
+  fi
+done
+
+# Determine clipboard command
+clipboard_cmd="pbcopy"
+if [[ "$(uname)" != "Darwin" ]]; then
+  if command -v xclip &> /dev/null; then
+    clipboard_cmd="xclip -selection clipboard"
+  else
+    echo "Error: xclip is required on Linux." >&2
+    exit 1
+  fi
+fi
+
+# Parse command-line options
+ignore_pattern=""
+tree_only=0
+quiet=0
+print=0
+debug=0
+positional=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--ignore)
+      ignore_pattern="$2"
+      shift 2
+      ;;
+    -t|--tree-only)
+      tree_only=1
+      shift
+      ;;
+    -q|--quiet)
+      quiet=1
+      shift
+      ;;
+    -p|--print)
+      print=1
+      shift
+      ;;
+    --debug)
+      debug=1
+      shift
+      ;;
+    -h|--help)
+      cat <<EOF
+Usage: llmcat [options] [path]
+       llmcat (interactive mode with fzf)
+
+Options:
+    -h, --help              Show this help message
+    -i, --ignore PATTERN    Additional ignore patterns (grep -E format)
+    -v, --version          Show version
+    -t, --tree-only        Only output directory tree
+    -q, --quiet            Silent mode (only copy to clipboard)
+    -p, --print            Print copied files/content (default: quiet)
+    --debug                Enable debug output
+EOF
+      exit 0
+      ;;
+    -v|--version)
+      echo "llmcat 0.1.0"
+      exit 0
+      ;;
+    --)
+      shift
+      positional+=("$@")
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      positional+=("$1")
+      shift
+      ;;
+  esac
+done
+
+set -- "${positional[@]}"
+target="${1:-}"
+
+# Debug function
+debug_echo() {
+  if [[ $debug -eq 1 ]]; then
+    echo "DEBUG: $*" >&2
+  fi
+}
+
+# Collect files respecting .gitignore and ignore patterns
+collect_files() {
+  local path="$1"
+  local files
+
+  # Use git ls-files if in a git repository (much faster)
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    debug_echo "Using git to list files"
+    files=$(git ls-files --cached --others --exclude-standard -- "$path")
+  else
+    debug_echo "Using find to list files"
+    files=$(find "$path" -type f 2>/dev/null)
+  fi
+
+  # Apply custom ignore patterns
+  if [[ -n "$ignore_pattern" ]]; then
+    files=$(echo "$files" | grep -vE "$ignore_pattern" || true)
+  fi
+
+  echo "$files"
+}
+
+# Generate directory tree for selected files
+generate_tree() {
+  local selected_files=("$@")
+  local dirs=()
+  for file in "${selected_files[@]}"; do
+    dirs+=("$(dirname "$file")")
+  done
+  local unique_dirs=($(printf "%s\n" "${dirs[@]}" | sort -u))
+  for dir in "${unique_dirs[@]}"; do
+    echo "# Directory: $dir"
+    tree -C --dirsfirst "$dir" 2>/dev/null || true
+    echo
+  done
+}
+
+# Generate file contents with bat
+generate_file_contents() {
+  local selected_files=("$@")
+  for file in "${selected_files[@]}"; do
+    echo "## File: $file"
+    echo "---"
+    bat --plain --paging=never "$file" 2>/dev/null || echo "Unable to display content."
+    echo
+  done
+}
+
+# Interactive mode
+if [[ -z "$target" ]]; then
+  debug_echo "Entering interactive mode."
+
+  # Get current directory in absolute form
+  root_dir=$(pwd)
+
+  # Collect all files using optimized method
+  all_files=$(collect_files "$root_dir")
+  if [[ -z "$all_files" ]]; then
+    echo "No files found." >&2
+    exit 1
+  fi
+
+  # Use fzf with faster preview
+  selected_files=()
+  while IFS= read -r -d $'\n' file; do
+    selected_files+=("$file")
+  done < <(echo "$all_files" | fzf --multi \
+    --bind 'tab:select,shift-tab:deselect,ctrl-/:toggle-preview' \
+    --preview "bat --color=always --line-range :500 '$root_dir/{}'" \
+    --preview-window 'right:60%' \
+    --header $'tab: select | shift-tab: unselect | ctrl-/ toggle preview | enter: confirm | esc: exit\n' \
+    --prompt 'Select files (CTRL-D for dirs, CTRL-F for files) > ')
+
+  if [[ ${#selected_files[@]} -eq 0 ]]; then
+    echo "No files selected."
+    exit 0
+  fi
+
+  # Generate output
+  output=""
+  if [[ $tree_only -eq 1 ]]; then
+    output=$(generate_tree "${selected_files[@]}")
+  else
+    output+=$(generate_tree "${selected_files[@]}")
+    output+=$'\n'
+    output+=$(generate_file_contents "${selected_files[@]}")
+  fi
+
+  # Handle output
+  if [[ $quiet -eq 0 ]] || [[ $print -eq 1 ]]; then
+    echo "$output"
+  fi
+  echo "$output" | $clipboard_cmd
+  exit 0
+fi
+
+# Non-interactive mode
+debug_echo "Processing target: $target"
+if [[ -d "$target" ]]; then
+  files=$(collect_files "$target")
+elif [[ -f "$target" ]]; then
+  files="$target"
+else
+  echo "Error: $target not found." >&2
+  exit 1
+fi
+
+# Process files
+selected_files=()
+while IFS= read -r -d $'\n' file; do
+  selected_files+=("$file")
+done < <(echo "$files")
+
+# Generate output
+output=""
+if [[ $tree_only -eq 1 ]]; then
+  output=$(generate_tree "${selected_files[@]}")
+else
+  output+=$(generate_tree "${selected_files[@]}")
+  output+=$'\n'
+  output+=$(generate_file_contents "${selected_files[@]}")
+fi
+
+# Handle output options
+if [[ $quiet -eq 0 ]] || [[ $print -eq 1 ]]; then
+  echo "$output"
+fi
+
+# Copy to clipboard if not quiet
+if [[ $quiet -eq 0 ]]; then
+  echo "$output" | $clipboard_cmd
+fi
+
+exit 0
